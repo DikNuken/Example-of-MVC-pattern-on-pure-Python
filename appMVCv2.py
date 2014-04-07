@@ -5,10 +5,12 @@
 #
 # By Pahaz Blinov.
 # ===========================
+import uuid
 
 __author__ = "pahaz"
 
 DB_FILE = "main.db"
+DB_SESSIONS_FILE = "sessions.db"
 DEBUG = False
 
 # ===========================
@@ -17,7 +19,6 @@ DEBUG = False
 #
 # ===========================
 
-from cgi import escape
 from urlparse import parse_qs
 import shelve
 
@@ -46,6 +47,10 @@ def parse_http_post_data(environ):
 
 def parse_http_get_data(environ):
     return parse_qs(environ["QUERY_STRING"])
+
+
+def parse_cookies(environ):
+    return dict([map(lambda s: s.strip(), x.split('=')) for x in environ['HTTP_COOKIE'].split(';')])
 
 
 def take_one_or_None(dict_, key):
@@ -115,6 +120,30 @@ class TextManager(object):
         return True
 
 
+class SessionModel():
+    def __init__(self):
+        self.session_id = str(uuid.uuid4())
+        self.amount_of_viewed_pages = 0
+
+
+class SessionManager():
+    def __init__(self):
+        self._db = shelve.open(DB_SESSIONS_FILE)
+
+
+    def get_or_create(self, session_id):
+        session = self._db.get(session_id)
+        if not session:
+            session = SessionModel()
+            self._db[session.session_id] = session
+            self._db.sync()
+        return session
+
+    def update(self, session):
+        self._db[session.session_id] = session
+        self._db.sync()
+
+
 # ===========================
 #
 #   Controller and Router
@@ -126,6 +155,7 @@ class Router(object):
     Router for requests.
 
     """
+
     def __init__(self):
         self._paths = {}
 
@@ -153,14 +183,18 @@ class TextController(object):
 
     def index(self, request_get_data):
         title = take_one_or_None(request_get_data, "title")
-        current_text = self.model_manager.get_by_title(title)
+        current_text = self.model_manager.get_by_title(title) \
+            if request_get_data["SESSION"].amount_of_viewed_pages <= 3 else None
 
         all_texts = self.model_manager.get_all()
 
         context = {
             "all": all_texts,
             "current": current_text,
+            "error": "Too many articles reviewed." if request_get_data["SESSION"].amount_of_viewed_pages > 3 else ""
         }
+        if current_text:
+            request_get_data["SESSION"].amount_of_viewed_pages += 1
 
         return 200, self.index_view.render(context)
 
@@ -204,6 +238,10 @@ class TextIndexView(object):
             """.format(current=context["current"])
         else:
             context["content"] = 'What do you want read?'
+        if context["error"]:
+            context["error"] = """
+            <h1 style="color:red;">{error}</h1>
+            """.format(error=context["error"])
 
         t = """
         <form method="GET">
@@ -215,6 +253,7 @@ class TextIndexView(object):
             <textarea name=content placeholder="Text content!" ></textarea> <br>
             <input type=submit value=write/rewrite />
         </form>
+        <div>{error}</div>
         <div>{content}</div>
         <ul>{titles}</ul>
         """
@@ -251,17 +290,20 @@ router.register("/text/add", controller.add)
 def application(environ, start_response):
     request_path = environ["PATH_INFO"]
     request_get_data = parse_http_get_data(environ)
-
+    cookies = parse_cookies(environ)
+    session = SessionManager().get_or_create(take_one_or_None(cookies, "session_id"))
+    request_get_data['SESSION'] = session
     # TODO: You can add this interesting line
     # print(parse_http_post_data(environ))
 
     http_status_code, response_body = router.route(request_path, request_get_data)
-
+    SessionManager().update(session)
     if DEBUG:
         response_body += "<br><br> The request ENV: {0}".format(repr(environ))
 
     response_status = http_status(http_status_code)
-    response_headers = [("Content-Type", "text/html")]
+    response_headers = [("Content-Type", "text/html"),
+                        ("Set-Cookie", "session_id=" + session.session_id), ]
 
     start_response(response_status, response_headers)
     return [response_body]  # it could be any iterable.
@@ -270,4 +312,5 @@ def application(environ, start_response):
 # if run as script do tests.
 if __name__ == "__main__":
     import doctest
+
     doctest.testmod()
